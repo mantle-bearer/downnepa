@@ -1,0 +1,27 @@
+{
+  "name": "DownNepa Lagos",
+  "short_name": "DownNepa",
+  "description": "Lagos electricity outage monitoring, verified incidents and community reporting",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#07100c",
+  "theme_color": "#07100c",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ],
+  "categories": ["utilities", "news"],
+  "lang": "en-NG"
+}
