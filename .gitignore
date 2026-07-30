@@ -35,6 +35,7 @@ yarn-error.log*
 
 # typescript
 next-env.d.ts
+*.tsbuildinfo
 /dist/
 /.wrangler/
 /.sites-runtime/
@@ -46,3 +47,7 @@ __pycache__/
 *.py[cod]
 .venv/
 backend/downnepa.db
+data/
+frontend/node_modules/
+frontend/dist/
+.npm-cache/

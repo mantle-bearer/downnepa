@@ -1,0 +1,11 @@
+run = "bash run.sh"
+entrypoint = "backend/app/main.py"
+
+[deployment]
+run = ["sh", "-c", "bash run.sh"]
+build = ["sh", "-c", "uv sync --frozen --no-dev && npm --prefix frontend ci && npm --prefix frontend run build"]
+deploymentTarget = "reserved-vm"
+
+[[ports]]
+localPort = 8000
+externalPort = 80

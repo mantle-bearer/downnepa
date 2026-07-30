@@ -1,0 +1,35 @@
+[project]
+name = "downnepa"
+version = "1.0.0"
+description = "Lagos-first electricity outage monitoring and verified-data platform"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "email-validator==2.2.0",
+    "fastapi==0.141.1",
+    "uvicorn[standard]==0.52.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx==0.28.1",
+    "pytest==8.4.1",
+    "ruff==0.16.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["backend/tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["app", "frontend"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+ignore = ["B008"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
