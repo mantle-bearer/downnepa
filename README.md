@@ -11,6 +11,22 @@ datasets.
 
 Live interface: https://downnepa.igbokwegoodluck8.chatgpt.site
 
+## Render deployment
+
+The repository includes `render.yaml`. If configuring Render manually:
+
+```bash
+# Build
+curl -LsSf https://astral.sh/uv/install.sh | sh && export PATH="$HOME/.local/bin:$PATH" && uv sync --frozen --no-dev && npm --prefix frontend ci && npm --prefix frontend run build
+
+# Start
+uv run --frozen --no-dev uvicorn backend.app.main:app --host 0.0.0.0 --port $PORT
+```
+
+Attach a persistent disk at `/opt/render/project/src/data`, set
+`DOWNNEPA_DB_PATH=/opt/render/project/src/data/downnepa.db`, and configure the
+admin credentials and web origin as private environment variables.
+
 ## Product capabilities
 
 - Anonymous outage monitoring for Lagos areas
@@ -22,6 +38,8 @@ Live interface: https://downnepa.igbokwegoodluck8.chatgpt.site
 - Active, shadow, retired, and rejected model lifecycle
 - Replaceable ML model contract
 - PWA-ready responsive interface
+- Complete 63-group NEPAWatch reference catalog plus child streets/landmarks
+- Temporary async prediction endpoint and dependency-free model training code
 
 ## Architecture
 

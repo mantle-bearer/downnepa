@@ -24,7 +24,8 @@ TRUSTED_SOURCE_HOSTS = {
     host.strip().lower()
     for host in os.getenv(
         "DOWNNEPA_TRUSTED_SOURCE_HOSTS",
-        "nerc.gov.ng,ikejaelectric.com,ekedp.com,nesistats.org",
+        "nerc.gov.ng,www.nerc.gov.ng,ikejaelectric.com,www.ikejaelectric.com,"
+        "ekedp.com,www.ekedp.com,nesistats.org,www.nesistats.org",
     ).split(",")
     if host.strip()
 }
@@ -255,6 +256,9 @@ def initialise() -> None:
                 ON CONFLICT(email) DO UPDATE SET role='admin'""",
                 (admin_email.lower(), hash_password(admin_password), "DownNepa Admin", "admin", 1.0, 500, iso_now()),
             )
+        from .extended import install
+
+        install(connection)
 
 
 @asynccontextmanager
@@ -263,7 +267,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="DownNepa API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="DownNepa API", version="2.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[item for item in os.getenv("DOWNNEPA_WEB_ORIGINS", "http://localhost:5173").split(",") if item],
@@ -277,6 +281,7 @@ class SignupIn(BaseModel):
     display_name: str = Field(min_length=2, max_length=60)
     email: EmailStr
     password: str = Field(min_length=8, max_length=128)
+    referral_code: str | None = Field(default=None, min_length=4, max_length=32)
 
 
 class LoginIn(BaseModel):
@@ -331,7 +336,7 @@ def issue_session(connection: sqlite3.Connection, user_id: int) -> str:
 
 
 def user_response(row: sqlite3.Row) -> dict:
-    return {
+    result = {
         "id": row["id"],
         "email": row["email"],
         "display_name": row["display_name"],
@@ -339,6 +344,9 @@ def user_response(row: sqlite3.Row) -> dict:
         "trust_score": row["trust_score"],
         "points": row["points"],
     }
+    if "referral_code" in row.keys():
+        result["referral_code"] = row["referral_code"]
+    return result
 
 
 def current_user(authorization: str | None = Header(default=None)):
@@ -395,6 +403,25 @@ def signup(body: SignupIn):
             )
         except sqlite3.IntegrityError:
             raise HTTPException(409, "An account already exists for this email")
+        referral_code = "DN" + hashlib.sha256(
+            f"downnepa:{cursor.lastrowid}".encode()
+        ).hexdigest()[:8].upper()
+        connection.execute(
+            "UPDATE users SET referral_code=? WHERE id=?",
+            (referral_code, cursor.lastrowid),
+        )
+        if body.referral_code:
+            referrer = connection.execute(
+                "SELECT id FROM users WHERE referral_code=?",
+                (body.referral_code.strip().upper(),),
+            ).fetchone()
+            if referrer and referrer["id"] != cursor.lastrowid:
+                connection.execute(
+                    """INSERT OR IGNORE INTO referrals
+                    (referrer_user_id,referred_user_id,code,created_at)
+                    VALUES(?,?,?,?)""",
+                    (referrer["id"], cursor.lastrowid, body.referral_code.strip().upper(), iso_now()),
+                )
         token = issue_session(connection, cursor.lastrowid)
         user = connection.execute("SELECT * FROM users WHERE id=?", (cursor.lastrowid,)).fetchone()
     return {"access_token": token, "user": user_response(user)}
@@ -496,6 +523,11 @@ def create_report(body: ReportIn, user=Depends(current_user)):
         except sqlite3.IntegrityError:
             raise HTTPException(409, "You already submitted this observation recently")
         award_points(connection, user["id"], 5, "report_submitted", "report", str(cursor.lastrowid))
+        from .extended import process_qualifying_contribution
+
+        process_qualifying_contribution(
+            connection, user["id"], body.state, observed, cursor.lastrowid
+        )
         connection.execute(
             "INSERT INTO audit_events(actor,action,entity_type,entity_id,detail,created_at) VALUES(?,?,?,?,?,?)",
             (str(user["id"]), "submit", "report", str(cursor.lastrowid), body.state, iso_now()),
@@ -688,6 +720,17 @@ def review_report(report_id: int, body: ReviewIn, admin=Depends(require_admin)):
             (str(admin["id"]), body.decision, "report", str(report_id), None, iso_now()),
         )
     return {"decision": body.decision}
+
+
+from .extended import router as extended_router
+
+app.include_router(extended_router)
+
+
+@app.get("/api/{path:path}", include_in_schema=False)
+def unknown_api(path: str):
+    del path
+    raise HTTPException(404, "API endpoint not found")
 
 
 if SPA_DIR.exists():

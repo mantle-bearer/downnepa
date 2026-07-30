@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: downnepa
+    runtime: python
+    plan: starter
+    buildCommand: >-
+      curl -LsSf https://astral.sh/uv/install.sh | sh &&
+      export PATH="$HOME/.local/bin:$PATH" &&
+      uv sync --frozen --no-dev &&
+      npm --prefix frontend ci &&
+      npm --prefix frontend run build
+    startCommand: >-
+      export PATH="$HOME/.local/bin:$PATH" &&
+      uv run --frozen --no-dev uvicorn backend.app.main:app
+      --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    disk:
+      name: downnepa-data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 1
+    envVars:
+      - key: DOWNNEPA_DB_PATH
+        value: /opt/render/project/src/data/downnepa.db
+      - key: DOWNNEPA_SESSION_DAYS
+        value: "14"
+      - key: DOWNNEPA_ADMIN_EMAIL
+        sync: false
+      - key: DOWNNEPA_ADMIN_PASSWORD
+        sync: false
+      - key: DOWNNEPA_WEB_ORIGINS
+        sync: false

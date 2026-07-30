@@ -73,8 +73,13 @@ function AuthModal({close,onSuccess}:{close:()=>void;onSuccess:(data:{access_tok
 }
 
 function AreaSearch({area,onSelect}:{area:Area;onSelect:(a:Area)=>void}) {
-  const [open,setOpen]=useState(false); const [query,setQuery]=useState("");
-  const matches=useMemo(()=>AREA_DATA.filter(a=>`${a.name} ${a.lga} ${a.feeder} ${a.aliases.join(" ")}`.toLowerCase().includes(query.toLowerCase())),[query]);
+  const [open,setOpen]=useState(false); const [query,setQuery]=useState(""); const [catalog,setCatalog]=useState<Area[]>(AREA_DATA);
+  useEffect(()=>{api.call("/api/areas").then((rows:any[])=>setCatalog(rows.map((a:any)=>({
+    slug:a.slug,name:a.name,lga:a.lga,disco:a.disco,service_band:a.service_band||"?",
+    feeder:a.feeder||"Feeder pending verification",aliases:a.aliases||[],status:"unknown" as Status,
+    confidence:0,reports:0,freshness:"No recent evidence",supply:0,history:[0,0,0,0,0,0,0]
+  })))).catch(()=>{})},[]);
+  const matches=useMemo(()=>catalog.filter(a=>`${a.name} ${a.lga} ${a.feeder} ${a.aliases.join(" ")}`.toLowerCase().includes(query.toLowerCase())),[catalog,query]);
   return <div className="area-search"><label>Where in Lagos?</label><button className="area-trigger" onClick={()=>setOpen(!open)}><span className="target">⌖</span><span><strong>{area.name}</strong><small>{area.lga} · {area.disco} · Band {area.service_band}</small></span><b>⌄</b></button>{open&&<div className="area-popover"><div className="search-input"><span>⌕</span><input autoFocus value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search area, street or feeder…"/></div><div className="area-results">{matches.map(item=><button className={item.slug===area.slug?"selected":""} key={item.slug} onClick={()=>{onSelect(item);setOpen(false);setQuery("")}}><i className={`dot ${item.status}`}/><span><strong>{item.name}</strong><small>{item.aliases.slice(0,2).join(" · ")}</small></span><em>{item.disco} · Band {item.service_band}</em><b>{statusCopy[item.status].label}</b></button>)}{!matches.length&&<div className="no-results"><strong>No mapped area yet</strong><span>Try an LGA, nearby landmark or feeder name.</span></div>}</div></div>}</div>;
 }
 
@@ -128,6 +133,7 @@ export default function App() {
   useEffect(()=>{const handler=()=>setPath(location.pathname);addEventListener("popstate",handler);return()=>removeEventListener("popstate",handler)},[]);
   useEffect(()=>{document.documentElement.dataset.theme=theme;localStorage.setItem("downnepa_theme",theme)},[theme]);
   useEffect(()=>{if(api.token())api.call("/api/auth/me").then(setUser).catch(()=>localStorage.removeItem("downnepa_token"))},[]);
+  useEffect(()=>{if("serviceWorker" in navigator)navigator.serviceWorker.register("/sw.js").catch(()=>{})},[]);
   function authenticated(data:{access_token:string;user:User}){localStorage.setItem("downnepa_token",data.access_token);setUser(data.user);setAuth(false);navigate("/dashboard")}
   async function logout(){try{await api.call("/api/auth/logout",{method:"POST"})}catch{}localStorage.removeItem("downnepa_token");setUser(null);navigate("/")}
   const page=path==="/dashboard"&&user?<Dashboard user={user}/>:path==="/admin"&&user?<Admin user={user}/>:<><Header user={user} theme={theme} toggleTheme={()=>setTheme(theme==="dark"?"light":"dark")} onAuth={()=>setAuth(true)} onLogout={logout}/><PublicMonitor user={user} onAuth={()=>setAuth(true)}/><Footer/></>;
