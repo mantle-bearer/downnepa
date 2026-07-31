@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import math
+import secrets
 from datetime import datetime
 from pathlib import Path
 
@@ -28,6 +29,19 @@ def feature_row(row: dict) -> dict:
         "weekday": observed.weekday() / 6,
         "evidence_count": min(float(row.get("evidence_count", 1)), 10) / 10,
     }
+
+
+def verified_snapshot_records(snapshot: dict) -> list[dict]:
+    """Return integrity-checked, non-demo training records."""
+    if snapshot.get("schema_version") != "downnepa-training-v1":
+        raise ValueError("Unsupported training snapshot")
+    rows = snapshot["records"]
+    digest = hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
+    if not secrets.compare_digest(digest, snapshot.get("sha256", "")):
+        raise ValueError("Training snapshot integrity check failed")
+    if any(row.get("verification_method") == "demo" for row in rows):
+        raise ValueError("Demo records cannot train a model")
+    return rows
 
 
 def sigmoid(value: float) -> float:
@@ -72,11 +86,8 @@ def main() -> None:
     parser.add_argument("--version", required=True)
     args = parser.parse_args()
     snapshot = json.loads(args.snapshot.read_text())
-    if snapshot.get("schema_version") != "downnepa-training-v1":
-        raise ValueError("Unsupported training snapshot")
-    rows = snapshot["records"]
-    if any(row.get("verification_method") == "demo" for row in rows):
-        raise ValueError("Demo records cannot train a model")
+    rows = verified_snapshot_records(snapshot)
+    digest = snapshot["sha256"]
     parameters, accuracy = train([feature_row(row) for row in rows])
     artifact = {
         "model_version": args.version,
@@ -85,7 +96,7 @@ def main() -> None:
         "features": FEATURES,
         **parameters,
         "metrics": {"training_accuracy": accuracy, "record_count": len(rows)},
-        "training_snapshot_sha256": snapshot["sha256"],
+        "training_snapshot_sha256": digest,
     }
     canonical = json.dumps(artifact, sort_keys=True, separators=(",", ":")).encode()
     artifact["sha256"] = hashlib.sha256(canonical).hexdigest()

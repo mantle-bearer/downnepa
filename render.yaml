@@ -4,8 +4,12 @@ services:
     runtime: python
     plan: starter
     buildCommand: >-
-      curl -LsSf https://astral.sh/uv/install.sh | sh &&
-      export PATH="$HOME/.local/bin:$PATH" &&
+      python -m pip download --no-deps --only-binary=:all:
+      --dest /tmp/downnepa-uv uv==0.11.33 &&
+      echo "9542178978b0b6f16a7ae99e55aca039f493a1edb373a15d7993eab80a28615a  /tmp/downnepa-uv/uv-0.11.33-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+      | sha256sum --check --strict &&
+      python -m pip install --no-deps
+      /tmp/downnepa-uv/uv-0.11.33-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl &&
       uv sync --frozen --no-dev &&
       npm --prefix frontend ci &&
       npm --prefix frontend run build

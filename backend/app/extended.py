@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import json
 import math
+import secrets
+import socket
 import sqlite3
 import urllib.request
 from datetime import UTC, datetime, timedelta
@@ -16,7 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
 from .catalog import BADGES, CHILDREN, GROUPS, slugify
-from .main import current_user, db, iso_now, require_admin, source_host
+from .main import current_user, db, iso_now, require_admin
 
 router = APIRouter(prefix="/api/v1")
 LAGOS_TZ = ZoneInfo("Africa/Lagos")
@@ -71,6 +74,10 @@ CREATE TABLE IF NOT EXISTS push_subscriptions(
  endpoint_hash TEXT UNIQUE NOT NULL,endpoint TEXT NOT NULL,p256dh TEXT NOT NULL,
  auth TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL,
  updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS raw_source_snapshots(
+ id INTEGER PRIMARY KEY,source TEXT NOT NULL,source_url TEXT NOT NULL,
+ source_hash TEXT UNIQUE NOT NULL,content_type TEXT NOT NULL,payload BLOB NOT NULL,
+ byte_count INTEGER NOT NULL,retrieved_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_locations_name ON locations(normalized_name);
 CREATE INDEX IF NOT EXISTS idx_alias_name ON location_aliases(normalized_alias);
 CREATE INDEX IF NOT EXISTS idx_location_area ON locations(service_area_id);
@@ -98,7 +105,12 @@ def install(connection: sqlite3.Connection) -> None:
         ensure_column(connection, "areas", name, declaration)
     ensure_column(connection, "saved_places", "notifications_enabled", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(connection, "pipeline_runs", "parser_version", "TEXT NOT NULL DEFAULT 'manual-v1'")
+    ensure_column(connection, "pipeline_runs", "raw_snapshot_id", "INTEGER")
     ensure_column(connection, "users", "referral_code", "TEXT")
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code "
+        "ON users(referral_code) WHERE referral_code IS NOT NULL"
+    )
     now = iso_now()
     for name, count, kind, lga, disco, lat, lng, active in GROUPS:
         slug = slugify(name)
@@ -182,8 +194,21 @@ def install(connection: sqlite3.Connection) -> None:
             badge,
         )
     for row in connection.execute("SELECT id FROM users WHERE referral_code IS NULL").fetchall():
-        code = "DN" + hashlib.sha256(f"downnepa:{row['id']}".encode()).hexdigest()[:8].upper()
-        connection.execute("UPDATE users SET referral_code=? WHERE id=?", (code,row["id"]))
+        assign_referral_code(connection, row["id"])
+
+
+def assign_referral_code(connection: sqlite3.Connection, user_id: int) -> str:
+    """Assign a cryptographically random referral code, retrying collisions."""
+    for _ in range(10):
+        code = "DN" + secrets.token_hex(8).upper()
+        try:
+            connection.execute(
+                "UPDATE users SET referral_code=? WHERE id=?", (code, user_id)
+            )
+            return code
+        except sqlite3.IntegrityError:
+            continue
+    raise RuntimeError("Could not allocate a unique referral code")
 
 
 def process_qualifying_contribution(
@@ -216,28 +241,34 @@ def process_qualifying_contribution(
         )
     totals = {
         "reports": connection.execute(
-            "SELECT COUNT(*) FROM reports WHERE user_id=? AND review_state!='rejected'",
+            "SELECT COUNT(*) FROM reports WHERE user_id=? AND review_state='verified'",
             (user_id,),
         ).fetchone()[0],
         "restorations": connection.execute(
             "SELECT COUNT(*) FROM reports WHERE user_id=? AND state='restored' "
-            "AND review_state!='rejected'",
+            "AND review_state='verified'",
             (user_id,),
         ).fetchone()[0],
         "streak": connection.execute(
             "SELECT current_streak FROM user_streaks WHERE user_id=?", (user_id,)
         ).fetchone()[0],
-        "night": connection.execute(
-            "SELECT COUNT(*) FROM reports WHERE user_id=? AND "
-            "CAST(strftime('%H',observed_at) AS INTEGER)>=22",
-            (user_id,),
-        ).fetchone()[0],
-        "early": connection.execute(
-            "SELECT COUNT(*) FROM reports WHERE user_id=? AND "
-            "CAST(strftime('%H',observed_at) AS INTEGER)<6",
+        "night_reports": 0,
+        "early_reports": 0,
+        "referrals": connection.execute(
+            "SELECT COUNT(*) FROM referrals WHERE referrer_user_id=? AND status='qualified'",
             (user_id,),
         ).fetchone()[0],
     }
+    verified_times = connection.execute(
+        "SELECT observed_at FROM reports WHERE user_id=? AND review_state='verified'",
+        (user_id,),
+    ).fetchall()
+    local_hours = [
+        datetime.fromisoformat(row["observed_at"]).astimezone(LAGOS_TZ).hour
+        for row in verified_times
+    ]
+    totals["night_reports"] = sum(hour < 6 for hour in local_hours)
+    totals["early_reports"] = sum(hour < 7 for hour in local_hours)
     for badge in connection.execute(
         "SELECT * FROM badge_definitions WHERE active=1"
     ).fetchall():
@@ -252,6 +283,42 @@ def process_qualifying_contribution(
         VALUES(?,?,?,?,?,?)""",
         (str(user_id), "gamification_processed", "report", str(report_id), state, iso_now()),
     )
+
+
+def reverse_report_rewards(
+    connection: sqlite3.Connection, user_id: int, report_id: int
+) -> None:
+    """Remove verification rewards and rebuild earned badges after rejection."""
+    event = connection.execute(
+        """SELECT points FROM point_events WHERE user_id=? AND reason='report_verified'
+        AND entity_type='report' AND entity_id=?""",
+        (user_id, str(report_id)),
+    ).fetchone()
+    if event:
+        connection.execute(
+            """DELETE FROM point_events WHERE user_id=? AND reason='report_verified'
+            AND entity_type='report' AND entity_id=?""",
+            (user_id, str(report_id)),
+        )
+        connection.execute(
+            "UPDATE users SET points=MAX(0,points-?) WHERE id=?",
+            (event["points"], user_id),
+        )
+    connection.execute("DELETE FROM user_badges WHERE user_id=?", (user_id,))
+    connection.execute("DELETE FROM user_streaks WHERE user_id=?", (user_id,))
+    verified = connection.execute(
+        """SELECT id,state,observed_at FROM reports WHERE user_id=?
+        AND review_state='verified' ORDER BY observed_at""",
+        (user_id,),
+    ).fetchall()
+    for report in verified:
+        process_qualifying_contribution(
+            connection,
+            user_id,
+            report["state"],
+            datetime.fromisoformat(report["observed_at"]),
+            report["id"],
+        )
 
 
 def status_for(connection: sqlite3.Connection, area_id: int) -> dict:
@@ -444,14 +511,39 @@ def leaderboard(period:Literal["weekly","monthly","all"]="weekly",limit:int=20):
 @router.get("/community/badges")
 def badges(user=Depends(current_user)):
     with db() as connection:
-        reports=connection.execute("SELECT COUNT(*) FROM reports WHERE user_id=? AND review_state!='rejected'",(user["id"],)).fetchone()[0]
+        reports=connection.execute("SELECT COUNT(*) FROM reports WHERE user_id=? AND review_state='verified'",(user["id"],)).fetchone()[0]
+        restorations=connection.execute(
+            """SELECT COUNT(*) FROM reports
+            WHERE user_id=? AND review_state='verified' AND state='restored'""",
+            (user["id"],),
+        ).fetchone()[0]
+        observed=connection.execute(
+            "SELECT observed_at FROM reports WHERE user_id=? AND review_state='verified'",
+            (user["id"],),
+        ).fetchall()
+        hours=[
+            datetime.fromisoformat(item["observed_at"]).astimezone(LAGOS_TZ).hour
+            for item in observed
+        ]
+        referrals=connection.execute(
+            """SELECT COUNT(*) FROM referrals
+            WHERE referrer_user_id=? AND status='qualified'""",
+            (user["id"],),
+        ).fetchone()[0]
         streak=connection.execute("SELECT current_streak FROM user_streaks WHERE user_id=?",(user["id"],)).fetchone()
         rows=connection.execute(
             """SELECT badge_definitions.*,user_badges.earned_at FROM badge_definitions
             LEFT JOIN user_badges ON user_badges.badge_id=badge_definitions.id
             AND user_badges.user_id=? WHERE badge_definitions.active=1""",(user["id"],)
         ).fetchall()
-        values={"reports":reports,"streak":streak["current_streak"] if streak else 0}
+        values={
+            "reports":reports,
+            "restorations":restorations,
+            "night_reports":sum(hour<6 for hour in hours),
+            "early_reports":sum(hour<7 for hour in hours),
+            "referrals":referrals,
+            "streak":streak["current_streak"] if streak else 0,
+        }
         return {"badges":[{**dict(row),"progress":min(row["threshold"],values.get(row["rule_kind"],0)),
                            "earned":bool(row["earned_at"])} for row in rows]}
 
@@ -503,12 +595,67 @@ def review_location(record_id:int,body:ReviewLocation,admin=Depends(require_admi
     with db() as connection:
         row=connection.execute("SELECT * FROM location_import_records WHERE id=?",(record_id,)).fetchone()
         if not row: raise HTTPException(404,"Review record not found")
-        connection.execute("UPDATE location_import_records SET review_state=?,updated_at=? WHERE id=?",(body.decision,iso_now(),record_id))
+        canonical_id = row["canonical_location_id"]
+        if body.decision == "approved":
+            try:
+                proposal_data = json.loads(row["raw_payload_json"])
+                expected_area_slug = proposal_data["expected_area_slug"]
+            except (json.JSONDecodeError, KeyError, TypeError) as error:
+                raise HTTPException(409, "Proposal cannot be canonicalized") from error
+            area = connection.execute(
+                "SELECT * FROM areas WHERE slug=? AND active=1",
+                (expected_area_slug,),
+            ).fetchone()
+            if not area:
+                raise HTTPException(409, "Proposal service area is unavailable")
+            location_slug = slugify(row["raw_name"])
+            existing = connection.execute(
+                "SELECT id FROM locations WHERE slug=?", (location_slug,)
+            ).fetchone()
+            if existing and existing["id"] != canonical_id:
+                location_slug = f"{location_slug}-{record_id}"
+            now = iso_now()
+            connection.execute(
+                """INSERT INTO locations(
+                slug,canonical_name,normalized_name,location_type,service_area_id,
+                verification_state,source_type,source_group,active,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,1,?,?)
+                ON CONFLICT(slug) DO UPDATE SET canonical_name=excluded.canonical_name,
+                normalized_name=excluded.normalized_name,
+                location_type=excluded.location_type,
+                service_area_id=excluded.service_area_id,
+                verification_state='member_verified',active=1,updated_at=excluded.updated_at""",
+                (
+                    location_slug,
+                    row["raw_name"],
+                    row["normalized_name"],
+                    row["parsed_location_type"] or "custom",
+                    area["id"],
+                    "member_verified",
+                    "member_proposal",
+                    area["name"],
+                    now,
+                    now,
+                ),
+            )
+            canonical_id = connection.execute(
+                "SELECT id FROM locations WHERE slug=?", (location_slug,)
+            ).fetchone()["id"]
+            connection.execute(
+                """INSERT OR IGNORE INTO location_aliases
+                (location_id,alias,normalized_alias,source_type) VALUES(?,?,?,?)""",
+                (canonical_id, row["raw_name"], row["normalized_name"], "member_proposal"),
+            )
+        connection.execute(
+            """UPDATE location_import_records
+            SET review_state=?,canonical_location_id=?,updated_at=? WHERE id=?""",
+            (body.decision, canonical_id, iso_now(), record_id),
+        )
         connection.execute(
             "INSERT INTO location_review_events(import_record_id,actor_user_id,action,old_state,new_state,notes,created_at) VALUES(?,?,?,?,?,?,?)",
             (record_id,admin["id"],"review",row["review_state"],body.decision,body.notes,iso_now()),
         )
-        return {"decision":body.decision}
+        return {"decision":body.decision,"canonical_location_id":canonical_id}
 
 
 @router.get("/admin/data-quality")
@@ -545,22 +692,91 @@ class AcquireIn(BaseModel):
     source_url:str
 
 
+APPROVED_ACQUISITION_HOSTS = {
+    "nerc.gov.ng",
+    "www.nerc.gov.ng",
+    "ikejaelectric.com",
+    "www.ikejaelectric.com",
+    "ekedp.com",
+    "www.ekedp.com",
+}
+
+
+def validate_acquisition_url(url: str) -> None:
+    """Reject non-HTTPS, non-allowlisted, or private-network acquisition targets."""
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in APPROVED_ACQUISITION_HOSTS:
+        raise ValueError("Source URL is not approved")
+    for item in socket.getaddrinfo(parsed.hostname, 443, type=socket.SOCK_STREAM):
+        address = ipaddress.ip_address(item[4][0])
+        if not address.is_global:
+            raise ValueError("Source host resolved to a non-public address")
+
+
+class ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Revalidate every redirect before urllib follows it."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        validate_acquisition_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 @router.post("/admin/pipeline/acquire",status_code=202)
 async def acquire(body:AcquireIn,admin=Depends(require_admin)):
-    del admin
-    if source_host(body.source_url) not in {"nerc.gov.ng","www.nerc.gov.ng","ikejaelectric.com","www.ikejaelectric.com","ekedp.com","www.ekedp.com"}:
+    try:
+        validate_acquisition_url(body.source_url)
+    except (ValueError, OSError, socket.gaierror):
         raise HTTPException(400,"Source domain is not approved")
     def download():
         request=urllib.request.Request(body.source_url,headers={"User-Agent":"DownNepaDataPipeline/1.0"})
-        with urllib.request.urlopen(request,timeout=25) as response:
+        opener = urllib.request.build_opener(ValidatingRedirectHandler())
+        with opener.open(request,timeout=25) as response:
             return response.read(10_000_001),response.headers.get("Content-Type","")
     try: payload,content_type=await asyncio.to_thread(download)
-    except OSError as error: raise HTTPException(502,"Trusted source could not be acquired") from error
+    except (OSError, ValueError) as error: raise HTTPException(502,"Trusted source could not be acquired") from error
     if len(payload)>10_000_000: raise HTTPException(413,"Source response exceeds 10 MB")
     digest=hashlib.sha256(payload).hexdigest()
     with db() as connection:
+        retrieved_at = iso_now()
+        connection.execute(
+            """INSERT INTO raw_source_snapshots(
+            source,source_url,source_hash,content_type,payload,byte_count,retrieved_at)
+            VALUES(?,?,?,?,?,?,?) ON CONFLICT(source_hash) DO NOTHING""",
+            (
+                body.source,
+                body.source_url,
+                digest,
+                content_type or "application/octet-stream",
+                payload,
+                len(payload),
+                retrieved_at,
+            ),
+        )
+        snapshot_id = connection.execute(
+            "SELECT id FROM raw_source_snapshots WHERE source_hash=?", (digest,)
+        ).fetchone()["id"]
         run=connection.execute(
-            "INSERT INTO pipeline_runs(source,source_url,source_hash,status,raw_count,parser_version,started_at,finished_at) VALUES(?,?,?,?,?,?,?,?)",
-            (body.source,body.source_url,digest,"acquired",1,"raw-acquire-v1",iso_now(),iso_now()),
+            """INSERT INTO pipeline_runs(
+            source,source_url,source_hash,status,raw_count,parser_version,
+            raw_snapshot_id,started_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+            (
+                body.source,body.source_url,digest,"acquired",1,"raw-acquire-v1",
+                snapshot_id,retrieved_at,retrieved_at,
+            ),
         ).lastrowid
-    return {"run_id":run,"source_hash":digest,"content_type":content_type,"byte_count":len(payload)}
+        connection.execute(
+            """INSERT INTO audit_events(
+            actor,action,entity_type,entity_id,detail,created_at) VALUES(?,?,?,?,?,?)""",
+            (
+                str(admin["id"]),
+                "acquire",
+                "raw_source_snapshot",
+                str(snapshot_id),
+                digest,
+                retrieved_at,
+            ),
+        )
+    return {"run_id":run,"snapshot_id":snapshot_id,"source_hash":digest,
+            "content_type":content_type,"byte_count":len(payload)}

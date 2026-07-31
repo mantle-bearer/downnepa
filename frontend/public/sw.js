@@ -8,5 +8,10 @@ self.addEventListener("fetch", event => {
     const copy = response.clone();
     caches.open(CACHE).then(cache => cache.put(event.request, copy));
     return response;
-  }).catch(() => caches.match(event.request).then(hit => hit || caches.match("/"))));
+  }).catch(async () => {
+    const hit = await caches.match(event.request);
+    if (hit) return hit;
+    if (event.request.mode === "navigate") return caches.match("/");
+    return Response.error();
+  }));
 });

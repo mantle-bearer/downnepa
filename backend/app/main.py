@@ -403,13 +403,9 @@ def signup(body: SignupIn):
             )
         except sqlite3.IntegrityError:
             raise HTTPException(409, "An account already exists for this email")
-        referral_code = "DN" + hashlib.sha256(
-            f"downnepa:{cursor.lastrowid}".encode()
-        ).hexdigest()[:8].upper()
-        connection.execute(
-            "UPDATE users SET referral_code=? WHERE id=?",
-            (referral_code, cursor.lastrowid),
-        )
+        from .extended import assign_referral_code
+
+        assign_referral_code(connection, cursor.lastrowid)
         if body.referral_code:
             referrer = connection.execute(
                 "SELECT id FROM users WHERE referral_code=?",
@@ -523,11 +519,6 @@ def create_report(body: ReportIn, user=Depends(current_user)):
         except sqlite3.IntegrityError:
             raise HTTPException(409, "You already submitted this observation recently")
         award_points(connection, user["id"], 5, "report_submitted", "report", str(cursor.lastrowid))
-        from .extended import process_qualifying_contribution
-
-        process_qualifying_contribution(
-            connection, user["id"], body.state, observed, cursor.lastrowid
-        )
         connection.execute(
             "INSERT INTO audit_events(actor,action,entity_type,entity_id,detail,created_at) VALUES(?,?,?,?,?,?)",
             (str(user["id"]), "submit", "report", str(cursor.lastrowid), body.state, iso_now()),
@@ -701,6 +692,7 @@ def review_report(report_id: int, body: ReviewIn, admin=Depends(require_admin)):
         report = connection.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
         if not report:
             raise HTTPException(404, "Report not found")
+        previous_state = report["review_state"]
         connection.execute("UPDATE reports SET review_state=? WHERE id=?", (body.decision, report_id))
         if body.decision == "verified":
             votes = connection.execute(
@@ -715,6 +707,84 @@ def review_report(report_id: int, body: ReviewIn, admin=Depends(require_admin)):
                 (report["area_id"], report["state"], confidence, report["observed_at"], iso_now(), evidence, "admin_review", f"{evidence} community observations"),
             )
             award_points(connection, report["user_id"], 10, "report_verified", "report", str(report_id))
+            from .extended import process_qualifying_contribution
+
+            process_qualifying_contribution(
+                connection,
+                report["user_id"],
+                report["state"],
+                datetime.fromisoformat(report["observed_at"]),
+                report_id,
+            )
+            referral = connection.execute(
+                """SELECT * FROM referrals WHERE referred_user_id=? AND status='pending'""",
+                (report["user_id"],),
+            ).fetchone()
+            if referral:
+                connection.execute(
+                    "UPDATE referrals SET status='qualified',qualified_at=? WHERE id=?",
+                    (iso_now(), referral["id"]),
+                )
+                award_points(
+                    connection,
+                    referral["referrer_user_id"],
+                    15,
+                    "referral_qualified",
+                    "referral",
+                    str(referral["id"]),
+                )
+                referral_count = connection.execute(
+                    """SELECT COUNT(*) FROM referrals
+                    WHERE referrer_user_id=? AND status='qualified'""",
+                    (referral["referrer_user_id"],),
+                ).fetchone()[0]
+                connection.execute(
+                    """INSERT OR IGNORE INTO user_badges(user_id,badge_id,earned_at)
+                    SELECT ?,id,? FROM badge_definitions
+                    WHERE rule_kind='referrals' AND threshold<=?""",
+                    (referral["referrer_user_id"], iso_now(), referral_count),
+                )
+        elif body.decision == "rejected" and previous_state == "verified":
+            from .extended import reverse_report_rewards
+
+            reverse_report_rewards(connection, report["user_id"], report_id)
+            other_verified = connection.execute(
+                """SELECT 1 FROM reports WHERE user_id=? AND review_state='verified'
+                LIMIT 1""",
+                (report["user_id"],),
+            ).fetchone()
+            referral = connection.execute(
+                """SELECT * FROM referrals
+                WHERE referred_user_id=? AND status='qualified'""",
+                (report["user_id"],),
+            ).fetchone()
+            if referral and not other_verified:
+                referral_event = connection.execute(
+                    """SELECT points FROM point_events
+                    WHERE user_id=? AND reason='referral_qualified'
+                    AND entity_type='referral' AND entity_id=?""",
+                    (referral["referrer_user_id"], str(referral["id"])),
+                ).fetchone()
+                if referral_event:
+                    connection.execute(
+                        """DELETE FROM point_events
+                        WHERE user_id=? AND reason='referral_qualified'
+                        AND entity_type='referral' AND entity_id=?""",
+                        (referral["referrer_user_id"], str(referral["id"])),
+                    )
+                    connection.execute(
+                        "UPDATE users SET points=MAX(0,points-?) WHERE id=?",
+                        (referral_event["points"], referral["referrer_user_id"]),
+                    )
+                connection.execute(
+                    """UPDATE referrals SET status='pending',qualified_at=NULL WHERE id=?""",
+                    (referral["id"],),
+                )
+                connection.execute(
+                    """DELETE FROM user_badges WHERE user_id=? AND badge_id IN
+                    (SELECT id FROM badge_definitions WHERE rule_kind='referrals')""",
+                    (referral["referrer_user_id"],),
+                )
         connection.execute(
             "INSERT INTO audit_events(actor,action,entity_type,entity_id,detail,created_at) VALUES(?,?,?,?,?,?)",
             (str(admin["id"]), body.decision, "report", str(report_id), None, iso_now()),
