@@ -18,6 +18,5 @@ class OutageRiskModel(Protocol):
     name: str
     feature_schema: str
 
-    def predict(self, features: Mapping[str, float | int | str]) -> Prediction:
+    async def predict(self, features: Mapping[str, float | int | str]) -> Prediction:
         ...
-
