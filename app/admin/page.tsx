@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 
 const REVIEW_QUEUE = [
   { id: "R-1042", area: "Yaba", state: "Light don go", evidence: "8 reports · official notice", age: "3m", score: 96 },
@@ -33,10 +34,10 @@ export default function Admin() {
   return (
     <main className="admin-shell">
       <aside className="admin-rail">
-        <a className="brand" href="/" aria-label="Back to DownNepa monitor">
+        <Link className="brand" href="/" aria-label="Back to DownNepa monitor">
           <span className="brand-mark"><i /></span>
           <span className="brand-name">Down<span>Nepa</span></span>
-        </a>
+        </Link>
         <nav>
           <button className={tab === "overview" ? "active" : ""} onClick={() => setTab("overview")}>Overview</button>
           <button className={tab === "pipeline" ? "active" : ""} onClick={() => setTab("pipeline")}>Data pipeline</button>
@@ -48,7 +49,7 @@ export default function Admin() {
       <section className="admin-main">
         <header className="admin-head">
           <div><span className="eyebrow">Protected operations</span><h1>{tab === "overview" ? "Trust overview" : tab === "pipeline" ? "Data pipeline" : "Model registry"}</h1></div>
-          <a href="/">View public monitor ↗</a>
+          <Link href="/">View public monitor ↗</Link>
         </header>
         <div className="admin-banner" role="status"><span>i</span>{message}</div>
 
