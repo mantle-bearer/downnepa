@@ -152,6 +152,15 @@ CREATE TABLE IF NOT EXISTS incidents (
   verification_method TEXT NOT NULL,
   source_summary TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS supply_daily (
+  id INTEGER PRIMARY KEY,
+  area_id INTEGER NOT NULL REFERENCES areas(id),
+  day TEXT NOT NULL,
+  available_hours REAL NOT NULL CHECK(available_hours >= 0 AND available_hours <= 24),
+  observation_count INTEGER NOT NULL DEFAULT 0,
+  source_summary TEXT NOT NULL DEFAULT 'Verified incidents and observations',
+  UNIQUE(area_id, day)
+);
 CREATE TABLE IF NOT EXISTS point_events (
   id INTEGER PRIMARY KEY,
   user_id INTEGER NOT NULL REFERENCES users(id),
@@ -474,6 +483,17 @@ def area_status(area_slug: str):
             WHERE area_id=? AND review_state!='rejected' ORDER BY created_at DESC LIMIT 12""",
             (area["id"],),
         ).fetchall()
+        supply_rows = connection.execute(
+            """SELECT day,available_hours,observation_count,source_summary
+            FROM supply_daily WHERE area_id=? ORDER BY day DESC LIMIT 7""",
+            (area["id"],),
+        ).fetchall()
+    supply_history = [dict(row) for row in reversed(supply_rows)]
+    supply_average = (
+        round(sum(row["available_hours"] for row in supply_rows) / len(supply_rows), 1)
+        if supply_rows
+        else None
+    )
     return {
         "area": {**dict(area), "aliases": json.loads(area["aliases_json"])},
         "status": incident["state"] if incident else "unknown",
@@ -482,6 +502,8 @@ def area_status(area_slug: str):
         "evidence_count": incident["evidence_count"] if incident else len(reports),
         "incident": dict(incident) if incident else None,
         "recent_reports": [dict(row) for row in reports],
+        "supply_average": supply_average,
+        "supply_history": supply_history,
         "prediction": None,
         "prediction_message": "ML prediction is not enabled yet",
     }
@@ -676,6 +698,7 @@ def admin_overview(admin=Depends(require_admin)):
             "reports": [dict(row) for row in connection.execute(
                 """SELECT reports.*,areas.name area,users.email reporter FROM reports
                 JOIN areas ON areas.id=reports.area_id JOIN users ON users.id=reports.user_id
+                WHERE reports.review_state='pending'
                 ORDER BY reports.created_at DESC LIMIT 50"""
             )],
             "audit_events": [dict(row) for row in connection.execute("SELECT * FROM audit_events ORDER BY id DESC LIMIT 50")],
