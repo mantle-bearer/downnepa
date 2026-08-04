@@ -96,6 +96,42 @@ uv run ruff check backend
 uv run pytest
 ```
 
+## Extensive local demo data
+
+Populate the local SQLite database with deterministic UX and integration-test
+data:
+
+```bash
+uv run python backend/scripts/seed_demo.py
+```
+
+The seed is safe to rerun. It refreshes only records marked as demo data and
+includes members, reports in every review state, votes, verified incidents,
+14-day supply histories, saved places, points, audit events, and pipeline runs.
+
+Development-only logins:
+
+```text
+Member: member@demo.downnepa.com / DownNepaDemo!2026
+Admin:  admin@demo.downnepa.com / DownNepaDemo!2026
+```
+
+Do not use these credentials in a production database.
+
+## End-to-end browser verification
+
+The Playwright suite builds the SPA, creates an isolated seeded database, starts
+the API, and exercises anonymous, member, and administrator flows at desktop and
+mobile viewports:
+
+```bash
+cd frontend
+npm run test:e2e
+```
+
+The responsive checks enforce a 12px minimum computed text size, usable target
+heights, named controls, and the absence of page-level horizontal overflow.
+
 Configure at least these variables before a production deployment:
 
 ```text
